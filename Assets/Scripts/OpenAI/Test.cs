@@ -12,10 +12,19 @@ public class Test : MonoBehaviour
 {
 	[SerializeField] private string apiKey; // Set your OpenAI API key in the inspector
 	[SerializeField] private TMP_Text chatText; // Assign a TMP_Text in the scene
-	[SerializeField] private ScrollRect scrollRect; // Optional: assign to auto-scroll
 	[SerializeField] private bool logToConsole = true; // Mirror chat to Unity Console
  	[SerializeField] private bool speakResponses = true; // Play assistant replies
  	[SerializeField] private AudioSource ttsSource; // Assign or auto-created
+	[SerializeField] private bool pauseWhileSpeaking = true; // Pause listening during TTS
+	[SerializeField, Range(0, 2000)] private int postSpeakCooldownMs = 300; // Extra delay
+	[SerializeField] private bool autoListen = true; // Auto-detect speech and send
+	[SerializeField, Range(0.001f, 0.1f)] private float vadThreshold = 0.01f; // RMS threshold
+	[SerializeField, Range(50, 1000)] private int vadWindowMs = 200; // analysis window
+	[SerializeField, Range(200, 2000)] private int vadSilenceMs = 800; // end utterance
+	[SerializeField, Range(200, 3000)] private int vadMinSpeechMs = 400; // min speech len
+	[SerializeField] private Image speakingBulb; // UI image to color
+	[SerializeField] private Color speakingColor = default; // red by default
+	[SerializeField] private Color idleColor = default; // green by default
 
 	private OpenAIAPI api;
 	private OpenAI_API.Chat.Conversation chat;
@@ -24,6 +33,13 @@ public class Test : MonoBehaviour
 	private string microphoneDevice;
 	private const int sampleRate = 16000; // Whisper works well with 16kHz
 	private const int maxRecordSeconds = 30;
+	private bool micRunning;
+	private int lastSamplePosition;
+	private bool inSpeech;
+	private int currentSpeechMs;
+	private int currentSilenceMs;
+	private System.Collections.Generic.List<float> speechBuffer = new System.Collections.Generic.List<float>(16000);
+	private bool isSpeaking;
 
 	private async void Start()
 	{
@@ -40,11 +56,159 @@ public class Test : MonoBehaviour
 		chat.AppendSystemMessage("You are a Patient Care Assistant.");
 		AppendToChat("Ready. Tap Record to speak.");
 
+		if (speakingColor == default) speakingColor = Color.red;
+		if (idleColor == default) idleColor = Color.green;
+		SetSpeaking(false);
+
 	if (ttsSource == null)
 	{
 		var existing = GetComponent<AudioSource>();
 		ttsSource = existing != null ? existing : gameObject.AddComponent<AudioSource>();
 	}
+
+	if (autoListen)
+	{
+		StartMicLoop();
+	}
+	}
+
+	private void StartMicLoop()
+	{
+		if (Microphone.devices.Length == 0)
+		{
+			AppendToChat("Error: No microphone found.");
+			return;
+		}
+		microphoneDevice = Microphone.devices[0];
+		recordingClip = Microphone.Start(microphoneDevice, true, 300, sampleRate);
+		micRunning = true;
+		lastSamplePosition = 0;
+		inSpeech = false;
+		currentSpeechMs = 0;
+		currentSilenceMs = 0;
+		AppendToChat("Listening...");
+	}
+
+	private void StopMicLoop()
+	{
+		if (!micRunning) return;
+		Microphone.End(microphoneDevice);
+		micRunning = false;
+		inSpeech = false;
+		speechBuffer.Clear();
+	}
+
+	private void OnDisable()
+	{
+		if (micRunning)
+		{
+			Microphone.End(microphoneDevice);
+			micRunning = false;
+		}
+	}
+
+	private void Update()
+	{
+		if (!autoListen || !micRunning || recordingClip == null) return;
+		if (pauseWhileSpeaking && (isSpeaking || (ttsSource != null && ttsSource.isPlaying))) return;
+
+		int windowSamples = Mathf.Max(1, sampleRate * vadWindowMs / 1000);
+		int pos = Microphone.GetPosition(microphoneDevice);
+		if (pos < 0) return;
+
+		int available = pos >= lastSamplePosition ? (pos - lastSamplePosition) : ((recordingClip.samples - lastSamplePosition) + pos);
+		while (available >= windowSamples)
+		{
+			var temp = new float[windowSamples];
+			recordingClip.GetData(temp, lastSamplePosition);
+			lastSamplePosition += windowSamples;
+			if (lastSamplePosition >= recordingClip.samples) lastSamplePosition -= recordingClip.samples;
+			available -= windowSamples;
+
+			float rms = 0f;
+			for (int i = 0; i < temp.Length; i++) rms += temp[i] * temp[i];
+			rms = Mathf.Sqrt(rms / temp.Length);
+
+			int deltaMs = vadWindowMs;
+			bool voiced = rms >= vadThreshold;
+
+			if (!inSpeech)
+			{
+				if (voiced)
+				{
+					inSpeech = true;
+					currentSpeechMs = deltaMs;
+					currentSilenceMs = 0;
+					speechBuffer.Clear();
+					speechBuffer.AddRange(temp);
+				}
+			}
+			else
+			{
+				speechBuffer.AddRange(temp);
+				if (voiced)
+				{
+					currentSpeechMs += deltaMs;
+					currentSilenceMs = 0;
+				}
+				else
+				{
+					currentSilenceMs += deltaMs;
+					if (currentSilenceMs >= vadSilenceMs)
+					{
+						if (currentSpeechMs >= vadMinSpeechMs)
+						{
+							var samples = speechBuffer.ToArray();
+							inSpeech = false;
+							currentSpeechMs = 0;
+							currentSilenceMs = 0;
+							_ = SendUtteranceFromSamples(samples);
+							speechBuffer.Clear();
+						}
+						else
+						{
+							inSpeech = false;
+							currentSpeechMs = 0;
+							currentSilenceMs = 0;
+							speechBuffer.Clear();
+						}
+					}
+				}
+			}
+		}
+	}
+
+	private async System.Threading.Tasks.Task SendUtteranceFromSamples(float[] samples)
+	{
+		if (samples == null || samples.Length == 0) return;
+		var clip = AudioClip.Create("utterance", samples.Length, 1, sampleRate, false);
+		clip.SetData(samples, 0);
+		var wavBytes = AudioClipToWav(clip);
+		var userText = await TranscribeWithWhisper(wavBytes);
+		if (string.IsNullOrWhiteSpace(userText))
+		{
+			AppendToChat("Error: Transcription failed.");
+			return;
+		}
+		AppendToChat("You: " + userText);
+		chat.AppendUserInput(userText);
+		try
+		{
+			var response = await chat.GetResponseFromChatbot();
+			AppendToChat("Assistant: " + response);
+			if (speakResponses && !string.IsNullOrWhiteSpace(response))
+			{
+				await Speak(response);
+			}
+		}
+		catch (HttpRequestException ex)
+		{
+			AppendToChat("Error: " + ex.Message);
+		}
+		catch (System.Exception ex)
+		{
+			AppendToChat("Error: " + ex.Message);
+		}
 	}
 
 	public void StartRecording()
@@ -105,11 +269,6 @@ public class Test : MonoBehaviour
 		if (chatText != null)
 		{
 			chatText.text += (chatText.text.Length > 0 ? "\n" : string.Empty) + line;
-			if (scrollRect != null)
-			{
-				Canvas.ForceUpdateCanvases();
-				scrollRect.verticalNormalizedPosition = 0f;
-			}
 		}
 
 		if (logToConsole)
@@ -256,6 +415,10 @@ public class Test : MonoBehaviour
 			var clip = DownloadHandlerAudioClip.GetContent(getClip);
 			ttsSource.clip = clip;
 			ttsSource.Play();
+			if (pauseWhileSpeaking)
+			{
+				StartSpeakingGuard(clip.length);
+			}
 		}
 	}
 
@@ -268,6 +431,43 @@ public class Test : MonoBehaviour
 		s = s.Replace("\r", "\\r");
 		s = s.Replace("\t", "\\t");
 		return s;
+	}
+
+	private void StartSpeakingGuard(float clipSeconds)
+	{
+		StopAllCoroutines();
+		SetSpeaking(true);
+		// Fully stop mic capture so phone speaker output is not re-captured
+		StopMicLoop();
+		StartCoroutine(SpeakingGuardCoroutine(Mathf.Max(0f, clipSeconds)));
+	}
+
+	private System.Collections.IEnumerator SpeakingGuardCoroutine(float clipSeconds)
+	{
+		isSpeaking = true;
+		if (clipSeconds > 0f)
+		{
+			yield return new WaitForSeconds(clipSeconds);
+		}
+		if (postSpeakCooldownMs > 0)
+		{
+			yield return new WaitForSeconds(postSpeakCooldownMs / 1000f);
+		}
+		SetSpeaking(false);
+		// Resume mic loop after speaking + cooldown
+		if (autoListen)
+		{
+			StartMicLoop();
+		}
+	}
+
+	private void SetSpeaking(bool value)
+	{
+		isSpeaking = value;
+		if (speakingBulb != null)
+		{
+			speakingBulb.color = value ? speakingColor : idleColor;
+		}
 	}
 
 	private AudioClip WavToAudioClip(byte[] wav)
