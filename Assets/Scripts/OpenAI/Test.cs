@@ -6,33 +6,37 @@ using TMPro;
 using System;
 using System.IO;
 using System.Text;
- using UnityEngine.Networking;
+using UnityEngine.Networking;
+using System.Text.RegularExpressions;
 
 public class Test : MonoBehaviour
 {
-	[SerializeField] private string apiKey; // Set your OpenAI API key in the inspector
-	[SerializeField] private TMP_Text chatText; // Assign a TMP_Text in the scene
-	[SerializeField] private bool logToConsole = true; // Mirror chat to Unity Console
- 	[SerializeField] private bool speakResponses = true; // Play assistant replies
- 	[SerializeField] private AudioSource ttsSource; // Assign or auto-created
-	[SerializeField] private bool pauseWhileSpeaking = true; // Pause listening during TTS
-	[SerializeField, Range(0, 2000)] private int postSpeakCooldownMs = 300; // Extra delay
-	[SerializeField] private bool autoListen = true; // Auto-detect speech and send
-	[SerializeField, Range(0.001f, 0.1f)] private float vadThreshold = 0.01f; // RMS threshold
-	[SerializeField, Range(50, 1000)] private int vadWindowMs = 200; // analysis window
-	[SerializeField, Range(200, 2000)] private int vadSilenceMs = 800; // end utterance
-	[SerializeField, Range(200, 3000)] private int vadMinSpeechMs = 400; // min speech len
-	[SerializeField] private Image speakingBulb; // UI image to color
-	[SerializeField] private Color speakingColor = default; // red by default
-	[SerializeField] private Color idleColor = default; // green by default
+	[SerializeField] private string apiKey;
+
+	[SerializeField] private TMP_Text chatText;
+	[SerializeField] private bool logToConsole = true;
+	[SerializeField] private bool speakResponses = true;
+	[SerializeField] private AudioSource ttsSource;
+	[SerializeField] private Image speakingBulb;
+	[SerializeField] private Color speakingColor = default;
+	[SerializeField] private Color idleColor = default;
+
+	[SerializeField] private bool pauseWhileSpeaking = true;
+	[SerializeField, Range(0, 2000)] private int postSpeakCooldownMs = 300;
+	[SerializeField] private bool autoListen = true;
+	[SerializeField, Range(0.001f, 0.1f)] private float vadThreshold = 0.01f;
+	[SerializeField, Range(50, 1000)] private int vadWindowMs = 200;
+	[SerializeField, Range(200, 2000)] private int vadSilenceMs = 800;
+	[SerializeField, Range(200, 3000)] private int vadMinSpeechMs = 400;
+	[SerializeField] private int maxRecordSeconds = 30;
+
 
 	private OpenAIAPI api;
 	private OpenAI_API.Chat.Conversation chat;
 
 	private AudioClip recordingClip;
 	private string microphoneDevice;
-	private const int sampleRate = 16000; // Whisper works well with 16kHz
-	private const int maxRecordSeconds = 30;
+	private const int sampleRate = 16000;
 	private bool micRunning;
 	private int lastSamplePosition;
 	private bool inSpeech;
@@ -53,7 +57,7 @@ public class Test : MonoBehaviour
 		api = new OpenAIAPI(apiKey);
 
 		chat = api.Chat.CreateConversation();
-		chat.AppendSystemMessage("You are a Patient Care Assistant.");
+		chat.AppendSystemMessage("You are a Patient Care Assistant. If the user asks for the current local time, respond with exactly [TIME_NOW] and nothing else. For reminders, always reply with a single trigger line in one of these formats, and nothing else: [REMIND|IN|1h3m10s|message] or [REMIND|IN|10s|message] or [REMIND|AT|08:34 PM|message].");
 		AppendToChat("Ready. Tap Record to speak.");
 
 		if (speakingColor == default) speakingColor = Color.red;
@@ -65,6 +69,8 @@ public class Test : MonoBehaviour
 		var existing = GetComponent<AudioSource>();
 		ttsSource = existing != null ? existing : gameObject.AddComponent<AudioSource>();
 	}
+
+	TimeService.OnReminderDue += HandleReminderDue;
 
 	if (autoListen)
 	{
@@ -195,6 +201,14 @@ public class Test : MonoBehaviour
 		try
 		{
 			var response = await chat.GetResponseFromChatbot();
+			if (!string.IsNullOrEmpty(response) && response.Contains("[TIME_NOW]"))
+			{
+				response = TimeService.GetCurrentTimeString();
+			}
+			else if (TryScheduleReminderFromTrigger(response, out var confirm))
+			{
+				response = confirm;
+			}
 			AppendToChat("Assistant: " + response);
 			if (speakResponses && !string.IsNullOrWhiteSpace(response))
 			{
@@ -248,6 +262,14 @@ public class Test : MonoBehaviour
 		try
 		{
 			var response = await chat.GetResponseFromChatbot();
+			if (!string.IsNullOrEmpty(response) && response.Contains("[TIME_NOW]"))
+			{
+				response = TimeService.GetCurrentTimeString();
+			}
+			else if (TryScheduleReminderFromTrigger(response, out var confirm2))
+			{
+				response = confirm2;
+			}
 			AppendToChat("Assistant: " + response);
  			if (speakResponses && !string.IsNullOrWhiteSpace(response))
  			{
@@ -266,10 +288,8 @@ public class Test : MonoBehaviour
 
 	private void AppendToChat(string line)
 	{
-		if (chatText != null)
-		{
-			chatText.text += (chatText.text.Length > 0 ? "\n" : string.Empty) + line;
-		}
+		if (chatText == null) return;
+		chatText.text += (chatText.text.Length > 0 ? "\n" : string.Empty) + line;
 
 		if (logToConsole)
 		{
@@ -295,24 +315,19 @@ public class Test : MonoBehaviour
 		using (var memoryStream = new MemoryStream())
 		using (var writer = new BinaryWriter(memoryStream, Encoding.UTF8))
 		{
-			// RIFF header
-			writer.Write(Encoding.ASCII.GetBytes("RIFF"));
+		writer.Write(Encoding.ASCII.GetBytes("RIFF"));
 			writer.Write(36 + bytesData.Length);
 			writer.Write(Encoding.ASCII.GetBytes("WAVE"));
-
-			// fmt chunk
-			writer.Write(Encoding.ASCII.GetBytes("fmt "));
+		writer.Write(Encoding.ASCII.GetBytes("fmt "));
 			writer.Write(16);
-			writer.Write((short)1); // PCM
+		writer.Write((short)1);
 			writer.Write((short)clip.channels);
 			writer.Write(sampleRate);
 			int byteRate = sampleRate * clip.channels * 2;
 			writer.Write(byteRate);
 			short blockAlign = (short)(clip.channels * 2);
 			writer.Write(blockAlign);
-			writer.Write((short)16); // bits per sample
-
-			// data chunk
+		writer.Write((short)16);
 			writer.Write(Encoding.ASCII.GetBytes("data"));
 			writer.Write(bytesData.Length);
 			writer.Write(bytesData);
@@ -324,7 +339,6 @@ public class Test : MonoBehaviour
 
 	private async System.Threading.Tasks.Task<string> TranscribeWithWhisper(byte[] wavBytes)
 	{
-		// Use UnityWebRequest to call Whisper transcription endpoint
 		var url = "https://api.openai.com/v1/audio/transcriptions";
 		var form = new WWWForm();
 		form.AddField("model", "whisper-1");
@@ -390,14 +404,12 @@ public class Test : MonoBehaviour
 			return;
 		}
 
-		// Surface JSON error bodies
 		if (bytes[0] == (byte)'{' || bytes[0] == (byte)'<')
 		{
 			AppendToChat("TTS error body: " + req.downloadHandler.text);
 			return;
 		}
 
-		// Save MP3 to file and load via Unity's decoder
 		var mp3Path = Path.Combine(Application.persistentDataPath, "tts.mp3");
 		File.WriteAllBytes(mp3Path, bytes);
 
@@ -467,6 +479,79 @@ public class Test : MonoBehaviour
 		if (speakingBulb != null)
 		{
 			speakingBulb.color = value ? speakingColor : idleColor;
+		}
+	}
+
+	private bool TryScheduleReminderFromTrigger(string line, out string confirm)
+	{
+		confirm = null;
+		if (string.IsNullOrEmpty(line)) return false;
+		var m = Regex.Match(line.Trim(), @"^\[REMIND\|(IN|AT)\|([^|]+)\|(.+)\]$", RegexOptions.IgnoreCase);
+		if (!m.Success) return false;
+		var mode = m.Groups[1].Value.ToUpperInvariant();
+		var spec = m.Groups[2].Value.Trim();
+		var message = m.Groups[3].Value.Trim();
+		if (mode == "IN")
+		{
+			if (!TryParseDuration(spec, out var ts)) return false;
+			TimeService.ScheduleReminderIn(ts, message);
+			confirm = $"Reminder set in {FormatSpan(ts)}: {message}";
+			return true;
+		}
+		else if (mode == "AT")
+		{
+			if (!DateTime.TryParse(spec, out var t)) return false;
+			var now = DateTime.Now;
+			var due = new DateTime(now.Year, now.Month, now.Day, t.Hour, t.Minute, 0);
+			if (due <= now) due = due.AddDays(1);
+			TimeService.ScheduleReminderAt(due, message);
+			confirm = $"Reminder set for {due:hh:mm tt}: {message}";
+			return true;
+		}
+		return false;
+	}
+
+	private bool TryParseDuration(string s, out TimeSpan ts)
+	{
+		ts = TimeSpan.Zero;
+		int h = 0, m = 0, sec = 0;
+		var match = Regex.Match(s, @"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", RegexOptions.IgnoreCase);
+		if (!match.Success) return false;
+		if (match.Groups[1].Success) h = int.Parse(match.Groups[1].Value);
+		if (match.Groups[2].Success) m = int.Parse(match.Groups[2].Value);
+		if (match.Groups[3].Success) sec = int.Parse(match.Groups[3].Value);
+		ts = new TimeSpan(h, m, sec);
+		return ts.TotalSeconds > 0;
+	}
+
+	private string FormatSpan(TimeSpan ts)
+	{
+		if (ts.TotalHours >= 1)
+		{
+			int h = (int)ts.TotalHours;
+			int m = ts.Minutes;
+			int s = ts.Seconds;
+			if (m == 0 && s == 0) return $"{h}h";
+			if (s == 0) return $"{h}h {m}m";
+			return $"{h}h {m}m {s}s";
+		}
+		if (ts.TotalMinutes >= 1)
+		{
+			int m = (int)ts.TotalMinutes;
+			int s = ts.Seconds;
+			if (s == 0) return $"{m}m";
+			return $"{m}m {s}s";
+		}
+		return $"{(int)ts.TotalSeconds}s";
+	}
+
+	private async void HandleReminderDue(string message)
+	{
+		var line = "Reminder: " + message;
+		AppendToChat(line);
+		if (speakResponses && !string.IsNullOrWhiteSpace(message))
+		{
+			await Speak(message);
 		}
 	}
 
