@@ -9,7 +9,7 @@ using System.Text;
 using UnityEngine.Networking;
 using System.Text.RegularExpressions;
 
-public class Test : MonoBehaviour
+public class Main : MonoBehaviour
 {
 	[SerializeField] private string apiKey;
 
@@ -343,6 +343,8 @@ public class Test : MonoBehaviour
 		var form = new WWWForm();
 		form.AddField("model", "whisper-1");
 		form.AddBinaryData("file", wavBytes, "speech.wav", "audio/wav");
+
+		form.AddField("language", "en");
 
 		using (var req = UnityEngine.Networking.UnityWebRequest.Post(url, form))
 		{
